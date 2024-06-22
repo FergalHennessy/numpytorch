@@ -1,9 +1,10 @@
-#we are implementing mini-batch gradient descent. For each mini-batch:
+#Autograd engine written from scratch in numpy
+
+#For each mini-batch:
 #1. Perform a forward pass for each data in mini-batch and calculate avg loss.
 #2. Calculate the gradients of the loss function based on average mini-batch loss.
 #3. update parameters
 
-#this network has no bias term, so a fictional dimension needs to be added to input data
 import numpy as np
 from tqdm import tqdm
 
@@ -44,24 +45,24 @@ class Layer:
     #step 4: dL/dWi =  dL/dhi @ dhi/dWi
     #step 5: accumulate gradients that were zeroed in forward
     #step 6: return dL/dx
-    def backward(self, output_derivative):
+    def backward(self, X, err):
 
         if self.nw and isinstance(self.activation_function, Softmax) \
             and isinstance(self.nw.loss, CrossEntropy):
             #print("shortcutting softmax gradient")
-            dLdh = output_derivative
+            dLdh = err
         else:
             #nxmxm such that ith element is dZi/dHi(mxm)
             dzdh = self.activation_function.backward(self.h)
             
             #dLdh = np.dot(output_derivative, dzdh)
-            dLdh = np.empty_like(output_derivative)
-            for i in range(output_derivative.shape[0]):
-                dLdh[i] = np.dot(output_derivative[i], dzdh[i].T)
+            dLdh = np.empty_like(err)
+            for i in range(err.shape[0]):
+                dLdh[i] = np.dot(err[i], dzdh[i].T)
 
         dLdX = np.dot(dLdh, self.weights.T)
         
-        dLdW = np.dot(self.input.T, dLdh)
+        dLdW = np.dot(X.T, dLdh)
         dLdB = np.sum(dLdh, axis=0)
 
         self.dW += dLdW
@@ -158,9 +159,9 @@ class CrossEntropy(Loss):
 # inbetween each layer, intermediate calculations
 # computation is done according to [ops, layer, ops, layer]
 # an intermediate generally 
-# data is a np array (Txd) of time data where th element is time-series input at time t
+# data is a np array (Txnxd) of time data where th element is time-series input at time t
 class Cell:
-    def __init__(self, layers, intermediates, inputs, outputs, data, cachesize):
+    def __init__(self, layers, intermediates, inputs, outputs, data):
 
         # each element of layers is a tuple (arg, layer, output)
         self.layers = layers
@@ -176,86 +177,136 @@ class Cell:
         # in backward pass, we set these locations to specified error,
         # then apply the backward methods in the reverse order of forward.
         self.outputs = outputs
-        # a list with cachesize + datasize elements for storing computation results.
-        # data is a Txd arra
-        self.cache = ([0] * cachesize) + [data[t] for t in range(data.shape[0])]
+        # cache has space for inputs, intermediates, outputs, and one object of time data.
+        # data is a Txnxd np array
+        self.oplength = sum(len(ilist) for ilist in intermediates) + len(layers) + len(inputs)
+        self.cache = [0] * (self.oplength + 1)
+        self.data = data
+        # the grad of loss wrt each element of the cell. indexes correspond to cache
+        self.err = [0] * (self.oplength + 1)
+        # there are layer_len + intermediate_len lists inside this list
+        # the tth element of the list corresponding to layer is the input at time t
+        # for intermediate, allinputs[cellop][time] is a 2 element tuple of np arrays
+        self.allinputs = [[] for _ in range(self.oplength - len(inputs))]
+
+        self.time = 0
 
     # forward propagation of a cell. takes inputs to the cell and time
-    # saves the inputs to their tensors and returns the output of cell
+    # saves all op inputs to allinpits and returns the output of cell
     # savedinputs is python array of np tensors input over time
-    def forward(self, inputs, time, savedinputs):
+    def forward(self, inputs):
         assert len(self.intermediates) == len(self.layers) + 1
         assert len(inputs) == len(self.inputs)
+
+        self.cache = [0] * (self.oplength + 1)
         for i in range(len(self.inputs)):
             self.cache[self.inputs[i]] = inputs[i]
-        
+            print("input[i] is ndarray: ", isinstance(inputs[i], np.ndarray))
+        self.cache[-1] = self.data[self.time, :, :]
+
         n = len(self.layers)
+        cellop = 0
         for i in range(n+1):
             for j in range(len(self.intermediates[i])):
                 self.cache[self.intermediates[i][j][3]] = \
                     self.intermediates[i][j][2].forward(
                     self.cache[self.intermediates[i][j][0]], 
                     self.cache[self.intermediates[i][j][1]])
+                #save in1, in2 of cellop to allinputs[cellop][time]
+                self.allinputs[cellop].append(
+                    [self.cache[self.intermediates[i][j][0]].copy(), 
+                     self.cache[self.intermediates[i][j][1]].copy()]) 
+                cellop += 1
             if i < n:    
                 self.cache[self.layers[i][2]] = \
                     self.layers[i][1].forward(self.cache[self.layers[i][0]])
-
+                self.allinputs[cellop].append(self.cache[self.layers[i][0]].copy())
+                cellop += 1
+        self.time += 1
         return [self.cache[i] for i in self.outputs]
 
+    # Error param is the gradient of loss wrt the layer outputs and is a nxd array.
+    # Save error in a gradient vector with the same indexes as cache.
+    # We subtract len(self.inputs) from cellop in allinputs bc input indices aren't ops and
+    # are therefore not saved
     def backward(self, error):
         assert len(error) == len(self.outputs) 
-        self.cache = [0] * len(self.cache)
+        self.err = [0] * (self.oplength + 1)
+        self.time -= 1
         for i in range(len(error)):
-            self.cache[self.outputs[i]] = error[i]
+            self.err[self.outputs[i]] = error[i]
 
         n = len(self.layers)
+        cellop = self.oplength - 1
         for i in list(reversed(range(n+1))):
             for j in range(len(self.intermediates[i])):
+                print("self.oplength: ", self.oplength)
+                print("self.allinputs: ", self.allinputs)
+                print("self.time: ", self.time, "cellop: ", cellop)
                 grad1, grad2 = self.intermediates[i][j][2].backward(
-                    self.cache[self.intermediates[i][j][0]], 
-                    self.cache[self.intermediates[i][j][1]], 
-                    self.cache[self.intermediates[i][j][3]])
-                self.cache[self.intermediates[i][j][0]] += grad1
-                self.cache[self.intermediates[i][j][1]] += grad2
+                    self.allinputs[cellop - len(self.inputs)][self.time][0], 
+                    self.allinputs[cellop - len(self.inputs)][self.time][1], 
+                    self.err[self.intermediates[i][j][3]])
+                print('grad1 is: ', grad1)
+                print('grad2 is: ', grad2)
+                print('allinputs is: ', self.allinputs)
+                self.err[self.intermediates[i][j][0]] += grad1
+                self.err[self.intermediates[i][j][1]] += grad2
+                print("self.err after backward iteration: ", self.err)
+                cellop -= 1
             if i > 0:    
                 self.cache[self.layers[i][0]] += \
                     self.layers[i][1].backward(
                         self.cache[self.intermediates[i][j][3]])
+                cellop -= 1
+        return [self.err[i] for i in self.inputs]
         
 
 # intermediate functions used in a neural net. multiple input forward, multiple output backward
 # backward method takes original input of the vector x1 and x2 and dL/dz err
+# identity should only be passed dupes
 class identity:
     def forward(self, x1, x2):
         return x1
     def backward(self, x1, x2, err): 
-        return err, None
-class hadamard: #receives strictly 1d vectors
+        return err, 0
+class hadamard: # elementwise prod 2 2d arrays
     def forward(self, x1, x2):
-        assert x1.shape == x2.shape
         return x1 * x2
     def backward(self, x1, x2, err):
-        assert x1.shape == x2.shape
         return x2 * err, x1 * err
+class addition: # elementwise add 2 2d arrays
+    def forward(self, x1, x2):
+        return x1 + x2
+    def backward(self, x1, x2, err):
+        return err, err
 
 
-
+# in this network, forward() runs forward of all layers and saves the input to each
+# backward() calls backward on each layer. Each layer collects dLdW and dLdB
+# after all layers have gradient computed, dLdW and dLdB are subtracted from W, B.
+# The loss for one forward pass is only relevant for one backward pass: clear after compute
 class FCNetwork:
     def __init__(self, lossfn=LeastSquares()):
         self.layers = []
         self.loss = lossfn
         self.loss.nw = self
         self.output_layer = None
+        self.all_inputs = None
     def forward(self, x, label):
+        self.all_inputs = []
         for layer in self.layers:
+            self.all_inputs.append(x)
             x = layer.forward(x)
         self.prediction = x
         return self.loss.calculate(x, label)
     
     def backward(self, label):
+        curr_layer = len(self.layers) - 1
         saved_grad = self.loss.backward(self.prediction, label)
         for layer in reversed(self.layers):
-            saved_grad = layer.backward(saved_grad)
+            saved_grad = layer.backward(self.all_inputs[curr_layer], saved_grad)
+            curr_layer -= 1
         for layer in self.layers:
             layer.weights = layer.weights - layer.dW * layer.learning_rate
             layer.bias = layer.bias - layer.dB * layer.learning_rate
@@ -305,8 +356,27 @@ def train_mini_batches(nw, X, y, batch_size, num_epochs):
                 nw.forward(X_shuffled[end_index : ], y_shuffled[end_index : ])
                 nw.backward(y_shuffled[end_index : ])
 
+
+
+# B is a cell with 
+# no layers
+# one identity op taking the 0th and 0th elements of cache to the 1st element of cache
+# self.oplength = cache length = grad length = 2
+# data has 1 time and 1 batch size and 3 dimensions
+# input is at index 0 of cache and output is at index 0 of cache
+
+B = Cell([], [[(0, 2, addition(), 1)]], [0], [1], np.array([[[1, 1]],[[1, 1]]]))
+one_array = [np.array([1, 2])]
+print("the result of numpy forward 1 is: ", temp:=B.forward(one_array))
+print("the result of numpy forward 2 is: ", temp:=B.forward(temp))
+print("the result of numpy backward 1  is: ", temp:=B.backward(np.array([2])))
+print("the result of numpy backward 2 is: ", B.backward(temp))
+
+
+
+
 #x_train shape: (60000, 28, 28) y_train shape: (60000,) x_test shape: (10000, 28, 28) y_test shape: (10000,) 
-(x_train, y_train), (x_test, y_test) = load_data('datasets/mnist.npz')
+"""(x_train, y_train), (x_test, y_test) = load_data('datasets/mnist.npz')
 xflat_train = x_train.reshape(x_train.shape[0], 28*28)
 xflat_test  =  x_test.reshape(x_test.shape[0], 28*28)
 print("y_train shape is", y_train.shape, "x_train shape is", x_train.shape)
@@ -339,4 +409,4 @@ y_test_pred = np.argmax(A.prediction, axis=1)
 correct_predictions = np.sum(y_test_pred == y_test)
 print("the accuracy of the network is", correct_predictions / y_test.shape[0])
 
-
+"""
